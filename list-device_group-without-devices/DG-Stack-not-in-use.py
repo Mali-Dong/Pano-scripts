@@ -134,6 +134,73 @@ def get_config_xml(base_url, api_key, verify_ssl, xpath, action="show"):
 
     return root
 
+def get_dg_hierarchy_xml(base_url, api_key, verify_ssl):
+    """
+    获取 Panorama 的 DG hierarchy（真实父子关系）
+    """
+    cmd = "<show><dg-hierarchy></dg-hierarchy></show>"
+
+    params = {
+        "type": "op",
+        "cmd": cmd,
+        "key": api_key
+    }
+
+    resp = requests.get(
+        f"{base_url}/api/",
+        params=params,
+        verify=verify_ssl,
+        timeout=60
+    )
+    resp.raise_for_status()
+
+    root = ET.fromstring(resp.text)
+    if root.attrib.get("status") != "success":
+        raise RuntimeError(f"获取 DG hierarchy 失败: {resp.text}")
+
+    return root
+
+def collect_parent_dgs_from_hierarchy(xml_root):
+    """
+    从 DG hierarchy XML 中提取所有“有子DG的父DG”
+    返回: set(parent_dg_names)
+    """
+
+    parent_dgs = set()
+
+    def get_node_name(elem):
+        # 常见情况1：<entry name="DG1">
+        if "name" in elem.attrib:
+            return elem.attrib["name"].strip()
+
+        # 常见情况2：<name>DG1</name>
+        name_elem = elem.find("./name")
+        if name_elem is not None and name_elem.text:
+            return name_elem.text.strip()
+
+        return None
+
+    def walk(elem):
+        current_name = get_node_name(elem)
+
+        # 找当前节点下的“直接命名子节点”
+        named_children = []
+        for child in list(elem):
+            child_name = get_node_name(child)
+            if child_name:
+                named_children.append(child)
+
+        # 如果当前节点自己有名字，并且它下面有命名子节点 => 当前节点是 parent DG
+        if current_name and named_children:
+            parent_dgs.add(current_name)
+
+        # 递归向下
+        for child in list(elem):
+            walk(child)
+
+    walk(xml_root)
+    return parent_dgs
+
 
 def get_device_groups_xml(base_url, api_key, verify_ssl, action="show"):
     xpath = "/config/devices/entry[@name='localhost.localdomain']/device-group"
@@ -154,6 +221,7 @@ def get_templates_xml(base_url, api_key, verify_ssl, action="show"):
 # DG 分析
 # =========================
 
+'''
 def parse_unused_device_groups(xml_root):
     """
     规则：
@@ -207,6 +275,7 @@ def parse_unused_device_groups(xml_root):
     #    支持空格、连字符、下划线、斜杠这几种常见命名习惯
     separators = [" ", "-", "_", "/"]
 
+
     for dg in all_groups:
         for other in all_groups:
             if other == dg:
@@ -220,6 +289,20 @@ def parse_unused_device_groups(xml_root):
                 if other.startswith(dg + sep):
                     dg_has_children[dg] = True
                     break
+
+    for dg in all_groups:
+        dg_keywords = set(dg.lower().replace('-', ' ').split())
+
+        for other in all_groups:
+            if other == dg:
+                continue
+
+            other_lower = other.lower()
+
+            # ✅ 判断：子DG是否包含父DG关键词
+            if all(word in other_lower for word in dg_keywords):
+                dg_has_children[dg] = True
+                break
 
     # 4. Debug 结构输出
     print("\n=== DG STRUCTURE DEBUG ===")
@@ -239,6 +322,75 @@ def parse_unused_device_groups(xml_root):
             continue
 
         # 规则2：叶子DG判断设备数
+        device_count = dg_devices.get(dg, 0)
+
+        if device_count == 0:
+            print(f"[RESULT] DG: {dg} -> NO device → UNUSED")
+            unused.append(dg)
+        else:
+            print(f"[RESULT] DG: {dg} -> device_count={device_count} → USED")
+
+    return all_groups, sorted(unused)
+'''
+
+def parse_unused_device_groups(xml_root, parent_dgs_from_hierarchy=None):
+    """
+    规则：
+    1. 如果 DG 有 sub-DG，则认为此 DG 是 USED
+    2. 只有叶子 DG 才判断设备数量
+    3. 如果叶子 DG 没有设备，则认为 UNUSED
+
+    优先使用真实 hierarchy 判断父DG
+    """
+
+    if parent_dgs_from_hierarchy is None:
+        parent_dgs_from_hierarchy = set()
+
+    dg_entries = xml_root.findall(".//result/device-group/entry")
+    if not dg_entries:
+        dg_entries = xml_root.findall(".//result/entry")
+
+    dg_devices = {}
+    dg_has_children = {}
+
+    # 1. 收集 DG 和设备数
+    for dg in dg_entries:
+        name = dg.attrib.get("name")
+        if not name:
+            continue
+
+        device_entries = dg.findall("./devices/entry")
+        device_members = dg.findall("./devices/member")
+        device_count = len(device_entries) + len(device_members)
+
+        dg_devices[name] = device_count
+        dg_has_children[name] = False
+
+    all_groups = sorted(dg_devices.keys())
+
+    # 2. 优先使用真实 hierarchy 判断
+    for dg in all_groups:
+        if dg in parent_dgs_from_hierarchy:
+            dg_has_children[dg] = True
+
+    # 3. Debug 输出
+    print("\n=== DG STRUCTURE DEBUG ===")
+    for dg in all_groups:
+        print(f"[STRUCT] DG: {dg} | has_children={dg_has_children[dg]} | devices={dg_devices[dg]}")
+    print("==========================\n")
+
+    # 4. 判断 unused
+    unused = []
+
+    for dg in all_groups:
+        print(f"[CHECK] DG: {dg}")
+
+        # 规则1：只要有子DG → USED
+        if dg_has_children.get(dg):
+            print(f"[RESULT] DG: {dg} -> HAS sub-DG → USED")
+            continue
+
+        # 规则2：叶子DG才判断设备数
         device_count = dg_devices.get(dg, 0)
 
         if device_count == 0:
@@ -381,10 +533,23 @@ def main():
         # DG
         # -------------------------------
         print("[2/6] 正在获取 Device Group 配置 ...")
-        dg_xml = get_device_groups_xml(base_url, api_key, verify_ssl, action=action)
+        #dg_xml = get_device_groups_xml(base_url, api_key, verify_ssl, action=action)
 
         print("[3/6] 正在分析未被任何设备使用的 Device Group ...")
-        all_groups, unused_groups = parse_unused_device_groups(dg_xml)
+        #all_groups, unused_groups = parse_unused_device_groups(dg_xml)
+
+        dg_xml = get_device_groups_xml(base_url, api_key, verify_ssl, action=action)
+
+        dg_hierarchy_xml = get_dg_hierarchy_xml(base_url, api_key, verify_ssl)
+        parent_dgs_from_hierarchy = collect_parent_dgs_from_hierarchy(dg_hierarchy_xml)
+
+        print(f"[INFO] 从 DG hierarchy 中识别到 {len(parent_dgs_from_hierarchy)} 个父 DG")
+        print(f"[INFO] parent DGs: {sorted(parent_dgs_from_hierarchy)}")
+
+        all_groups, unused_groups = parse_unused_device_groups(
+            dg_xml,
+            parent_dgs_from_hierarchy
+        )
 
         print("\n========== DEVICE GROUP RESULT ==========")
         print(f"Device Group 总数: {len(all_groups)}")
